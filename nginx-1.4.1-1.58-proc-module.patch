@@ -1,0 +1,1307 @@
+diff --git a/auto/make b/auto/make
+index 05b7454..6c32920 100644
+--- a/auto/make
++++ b/auto/make
+@@ -10,7 +10,8 @@ mkdir -p $NGX_OBJS/src/core $NGX_OBJS/src/event $NGX_OBJS/src/event/modules \
+          $NGX_OBJS/src/http $NGX_OBJS/src/http/modules \
+ 	 $NGX_OBJS/src/http/modules/perl \
+          $NGX_OBJS/src/mail \
+-         $NGX_OBJS/src/misc
++         $NGX_OBJS/src/misc \
++	 $NGX_OBJS/src/proc
+ 
+ 
+ ngx_objs_dir=$NGX_OBJS$ngx_regex_dirsep
+diff --git a/auto/modules b/auto/modules
+index a78e785..5315338 100644
+--- a/auto/modules
++++ b/auto/modules
+@@ -61,6 +61,16 @@ if [ $NGX_TEST_BUILD_SOLARIS_SENDFILEV = YES ]; then
+ fi
+ 
+ 
++if [ $PROCS = YES ]; then
++    have=NGX_PROCS . auto/have
++    CORE_SRCS="$CORE_SRCS $PROCS_SRCS"
++    CORE_DEPS="$CORE_DEPS $PROCS_DEPS"
++    CORE_INCS="$CORE_INCS $PROCS_INCS"
++else
++    PROCS_MODULES=
++fi
++
++
+ if [ $HTTP != YES ]; then
+     have=NGX_CRYPT . auto/nohave
+     CRYPT_LIB=
+@@ -418,7 +428,7 @@ if [ $MAIL_SSL = YES ]; then
+ fi
+ 
+ 
+-modules="$CORE_MODULES $EVENT_MODULES"
++modules="$CORE_MODULES $EVENT_MODULES $PROCS_MODULES"
+ 
+ 
+ if [ $USE_OPENSSL = YES ]; then
+diff --git a/auto/options b/auto/options
+index 6713379..29b306a 100644
+--- a/auto/options
++++ b/auto/options
+@@ -110,6 +110,9 @@ MAIL_POP3=YES
+ MAIL_IMAP=YES
+ MAIL_SMTP=YES
+ 
++# procs module
++PROCS=YES
++
+ NGX_ADDONS=
+ 
+ USE_PCRE=NO
+@@ -189,6 +192,9 @@ do
+         #--with-threads=*)                USE_THREADS="$value"       ;;
+         #--with-threads)                  USE_THREADS="pthreads"     ;;
+ 
++        # PROCS
++        --without-procs)                 PROCS=NO                   ;;
++
+         --with-file-aio)                 NGX_FILE_AIO=YES           ;;
+         --with-ipv6)                     NGX_IPV6=YES               ;;
+ 
+@@ -347,6 +353,8 @@ cat << END
+   --with-poll_module                 enable poll module
+   --without-poll_module              disable poll module
+ 
++  --without-procs                    disable procs module
++
+   --with-file-aio                    enable file AIO support
+   --with-ipv6                        enable IPv6 support
+ 
+diff --git a/auto/sources b/auto/sources
+index 90465c3..f78e36f 100644
+--- a/auto/sources
++++ b/auto/sources
+@@ -126,6 +126,13 @@ RTSIG_SRCS=src/event/modules/ngx_rtsig_module.c
+ IOCP_MODULE=ngx_iocp_module
+ IOCP_SRCS=src/event/modules/ngx_iocp_module.c
+ 
++
++PROCS_MODULES="ngx_procs_module ngx_proc_core_module"
++PROCS_DEPS="src/proc/ngx_proc.h"
++PROCS_INCS="src/proc"
++PROCS_SRCS="src/proc/ngx_proc.c"
++
++
+ AIO_MODULE=ngx_aio_module
+ AIO_SRCS="src/event/modules/ngx_aio_module.c \
+           src/os/unix/ngx_aio_read.c \
+diff --git a/src/core/ngx_core.h b/src/core/ngx_core.h
+index dfcf2d5..6a9ae54 100644
+--- a/src/core/ngx_core.h
++++ b/src/core/ngx_core.h
+@@ -83,6 +83,9 @@ typedef void (*ngx_connection_handler_pt)(ngx_connection_t *c);
+ #define CR     (u_char) 13
+ #define CRLF   "\x0d\x0a"
+ 
++#if (NGX_PROCS)
++#include <ngx_proc.h>
++#endif
+ 
+ #define ngx_abs(value)       (((value) >= 0) ? (value) : - (value))
+ #define ngx_max(val1, val2)  ((val1 < val2) ? (val2) : (val1))
+diff --git a/src/os/unix/ngx_process.c b/src/os/unix/ngx_process.c
+index 4ef3582..8839630 100644
+--- a/src/os/unix/ngx_process.c
++++ b/src/os/unix/ngx_process.c
+@@ -393,6 +393,7 @@ ngx_signal_handler(int signo)
+ 
+     case NGX_PROCESS_WORKER:
+     case NGX_PROCESS_HELPER:
++    case NGX_PROCESS_PROC:
+         switch (signo) {
+ 
+         case ngx_signal_value(NGX_NOACCEPT_SIGNAL):
+diff --git a/src/os/unix/ngx_process_cycle.c b/src/os/unix/ngx_process_cycle.c
+index dfdfae0..dacfaf6 100644
+--- a/src/os/unix/ngx_process_cycle.c
++++ b/src/os/unix/ngx_process_cycle.c
+@@ -137,6 +137,10 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
+                                NGX_PROCESS_RESPAWN);
+     ngx_start_cache_manager_processes(cycle, 0);
+ 
++#if (NGX_PROCS)
++    ngx_procs_start(cycle, 0);
++#endif
++
+     ngx_new_binary = 0;
+     delay = 0;
+     sigio = 0;
+@@ -230,6 +234,10 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
+                 ngx_start_worker_processes(cycle, ccf->worker_processes,
+                                            NGX_PROCESS_RESPAWN);
+                 ngx_start_cache_manager_processes(cycle, 0);
++
++#if (NGX_PROCS)
++                ngx_procs_start(cycle, 0);
++#endif
+                 ngx_noaccepting = 0;
+ 
+                 continue;
+@@ -250,6 +258,9 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
+                                        NGX_PROCESS_JUST_RESPAWN);
+             ngx_start_cache_manager_processes(cycle, 1);
+ 
++#if (NGX_PROCS)
++            ngx_procs_start(cycle, 1);
++#endif
+             /* allow new processes to start */
+             ngx_msleep(100);
+ 
+@@ -263,6 +274,11 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
+             ngx_start_worker_processes(cycle, ccf->worker_processes,
+                                        NGX_PROCESS_RESPAWN);
+             ngx_start_cache_manager_processes(cycle, 0);
++
++#if (NGX_PROCS)
++            ngx_procs_start(cycle, 0);
++#endif
++
+             live = 1;
+         }
+ 
+@@ -1293,8 +1309,8 @@ ngx_cache_manager_process_cycle(ngx_cycle_t *cycle, void *data)
+ {
+     ngx_cache_manager_ctx_t *ctx = data;
+ 
+-    void         *ident[4];
+-    ngx_event_t   ev;
++    void                    *ident[4];
++    ngx_event_t              ev;
+ 
+     /*
+      * Set correct process type since closing listening Unix domain socket
+diff --git a/src/os/unix/ngx_process_cycle.h b/src/os/unix/ngx_process_cycle.h
+index 94747b8..b4461d6 100644
+--- a/src/os/unix/ngx_process_cycle.h
++++ b/src/os/unix/ngx_process_cycle.h
+@@ -25,6 +25,7 @@
+ #define NGX_PROCESS_SIGNALLER  2
+ #define NGX_PROCESS_WORKER     3
+ #define NGX_PROCESS_HELPER     4
++#define NGX_PROCESS_PROC       5
+ 
+ 
+ typedef struct {
+diff --git a/src/proc/ngx_proc.c b/src/proc/ngx_proc.c
+new file mode 100644
+index 0000000..4e582a4
+--- /dev/null
++++ b/src/proc/ngx_proc.c
+@@ -0,0 +1,1014 @@
++
++/*
++ * Copyright (C) 2010-2012 Alibaba Group Holding Limited
++ */
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_channel.h>
++#include <ngx_proc.h>
++
++
++static char *ngx_procs_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
++static void ngx_procs_cycle(ngx_cycle_t *cycle, void *data);
++static void ngx_procs_process_init(ngx_cycle_t *cycle,
++    ngx_proc_module_t *module, ngx_int_t priority);
++static void ngx_procs_channel_handler(ngx_event_t *ev);
++static void ngx_procs_process_exit(ngx_cycle_t *cycle,
++    ngx_proc_module_t *module);
++static void ngx_procs_pass_open_channel(ngx_cycle_t *cycle, ngx_channel_t *ch);
++
++static char *ngx_proc_process(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
++static void *ngx_proc_create_main_conf(ngx_conf_t *cf);
++static void *ngx_proc_create_conf(ngx_conf_t *cf);
++static char *ngx_proc_merge_conf(ngx_conf_t *cf, void *parent, void *child);
++static char *ngx_procs_set_priority(ngx_conf_t *cf, ngx_command_t *cmd,
++    void *conf);
++
++
++static ngx_command_t ngx_procs_commands[] = {
++
++    { ngx_string("processes"),
++      NGX_MAIN_CONF|NGX_CONF_BLOCK|NGX_CONF_NOARGS,
++      ngx_procs_block,
++      0,
++      0,
++      NULL },
++
++      ngx_null_command
++};
++
++
++static ngx_core_module_t  ngx_procs_module_ctx = {
++    ngx_string("procs"),
++    NULL,
++    NULL
++};
++
++
++ngx_module_t  ngx_procs_module = {
++    NGX_MODULE_V1,
++    &ngx_procs_module_ctx,                 /* module context */
++    ngx_procs_commands,                    /* module directives */
++    NGX_CORE_MODULE,                       /* module type */
++    NULL,                                  /* init master */
++    NULL,                                  /* init module */
++    NULL,                                  /* init process */
++    NULL,                                  /* init thread */
++    NULL,                                  /* exit thread */
++    NULL,                                  /* exit process */
++    NULL,                                  /* exit master */
++    NGX_MODULE_V1_PADDING
++};
++
++
++static ngx_command_t ngx_proc_core_commands[] = {
++
++    { ngx_string("process"),
++      NGX_PROC_MAIN_CONF|NGX_CONF_BLOCK|NGX_CONF_TAKE1,
++      ngx_proc_process,
++      0,
++      0,
++      NULL },
++
++    { ngx_string("count"),
++      NGX_PROC_CONF|NGX_CONF_TAKE1,
++      ngx_conf_set_num_slot,
++      NGX_PROC_CONF_OFFSET,
++      offsetof(ngx_proc_conf_t, count),
++      NULL },
++
++    { ngx_string("priority"),
++      NGX_PROC_CONF|NGX_CONF_TAKE1,
++      ngx_procs_set_priority,
++      NGX_PROC_CONF_OFFSET,
++      0,
++      NULL },
++
++    { ngx_string("delay_start"),
++      NGX_PROC_CONF|NGX_CONF_TAKE1,
++      ngx_conf_set_msec_slot,
++      NGX_PROC_CONF_OFFSET,
++      offsetof(ngx_proc_conf_t, delay_start),
++      NULL },
++
++    { ngx_string("respawn"),
++      NGX_PROC_CONF|NGX_CONF_FLAG,
++      ngx_conf_set_flag_slot,
++      NGX_PROC_CONF_OFFSET,
++      offsetof(ngx_proc_conf_t, respawn),
++      NULL },
++
++      ngx_null_command
++};
++
++
++static ngx_proc_module_t ngx_proc_core_module_ctx = {
++    ngx_string("proc_core"),
++    ngx_proc_create_main_conf,
++    NULL,
++    ngx_proc_create_conf,
++    ngx_proc_merge_conf,
++    NULL,
++    NULL,
++    NULL,
++    NULL
++};
++
++
++ngx_module_t  ngx_proc_core_module = {
++    NGX_MODULE_V1,
++    &ngx_proc_core_module_ctx,             /* module context */
++    ngx_proc_core_commands,                /* module directives */
++    NGX_PROC_MODULE,                       /* module type */
++    NULL,                                  /* init master */
++    NULL,                                  /* init module */
++    NULL,                                  /* init process */
++    NULL,                                  /* init thread */
++    NULL,                                  /* exit thread */
++    NULL,                                  /* exit process */
++    NULL,                                  /* exit master */
++    NGX_MODULE_V1_PADDING
++};
++
++
++static ngx_uint_t       ngx_procs_max_module;
++static ngx_cycle_t      ngx_procs_exit_cycle;
++static ngx_log_t        ngx_procs_exit_log;
++static ngx_open_file_t  ngx_procs_exit_log_file;
++#if (NGX_SYSLOG)
++static ngx_syslog_t     ngx_procs_exit_log_syslog;
++#endif
++
++
++static char *
++ngx_procs_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
++{
++    char                 *rv;
++    ngx_uint_t            i, mi, p;
++    ngx_conf_t            pcf;
++    ngx_proc_conf_t     **cpcfp;
++    ngx_proc_module_t     *module;
++    ngx_proc_conf_ctx_t   *ctx;
++    ngx_proc_main_conf_t  *cmcf;
++
++    /* the procs context */
++    ctx = ngx_pcalloc(cf->pool, sizeof(ngx_proc_conf_ctx_t));
++    if (ctx == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    *(ngx_proc_conf_ctx_t **) conf = ctx;
++
++    ngx_procs_max_module = 0;
++
++    for (i = 0; ngx_modules[i]; i++) {
++        if (ngx_modules[i]->type != NGX_PROC_MODULE) {
++            continue;
++        }
++
++        ngx_modules[i]->ctx_index = ngx_procs_max_module++;
++    }
++
++    ctx->main_conf = ngx_pcalloc(cf->pool,
++                                 ngx_procs_max_module * sizeof(void *));
++    if (ctx->main_conf == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    ctx->proc_conf = ngx_pcalloc(cf->pool,
++                                 sizeof(void *) * ngx_procs_max_module);
++    if (ctx->proc_conf == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    /* create the main_confs for all proc modules */
++
++    for (i = 0; ngx_modules[i]; i++) {
++        if (ngx_modules[i]->type != NGX_PROC_MODULE) {
++            continue;
++        }
++
++        module = ngx_modules[i]->ctx;
++        mi = ngx_modules[i]->ctx_index;
++
++        if (module->create_main_conf) {
++
++            ctx->main_conf[mi] = module->create_main_conf(cf);
++
++            if (ctx->main_conf[mi] == NULL) {
++                return NGX_CONF_ERROR;
++            }
++        }
++
++        if (module->create_proc_conf) {
++            ctx->proc_conf[mi] = module->create_proc_conf(cf);
++
++            if (ctx->proc_conf[mi] == NULL) {
++                return NGX_CONF_ERROR;
++            }
++        }
++    }
++
++
++    pcf = *cf;
++    cf->ctx = ctx;
++
++    /* parse inside the procs block */
++    cf->module_type = NGX_PROC_MODULE;
++    cf->cmd_type = NGX_PROC_MAIN_CONF;
++
++    rv = ngx_conf_parse(cf, NULL);
++
++    if (rv != NGX_CONF_OK) {
++        *cf = pcf;
++        return rv;
++    }
++
++    cmcf = ctx->main_conf[ngx_proc_core_module.ctx_index];
++    cpcfp = cmcf->processes.elts;
++
++    for (i = 0; ngx_modules[i]; i++) {
++
++        if (ngx_modules[i]->type != NGX_PROC_MODULE) {
++            continue;
++        }
++
++        module = ngx_modules[i]->ctx;
++        mi = ngx_modules[i]->ctx_index;
++
++        cf->ctx = ctx;
++
++        if (module->init_main_conf) {
++            rv = module->init_main_conf(cf,ctx->main_conf[mi]);
++            if (rv != NGX_CONF_OK) {
++                *cf = pcf;
++                return rv;
++            }
++        }
++
++        for (p = 0; p < cmcf->processes.nelts; p++) {
++
++            cf->ctx = cpcfp[p]->ctx;
++
++            if (ngx_strcmp(module->name.data, cpcfp[p]->name.data) == 0
++                || ngx_strcmp(module->name.data, "proc_core") == 0)
++            {
++                if (module->merge_proc_conf) {
++                    rv = module->merge_proc_conf(cf, ctx->proc_conf[mi],
++                                                 cpcfp[p]->ctx->proc_conf[mi]);
++
++                    if (rv != NGX_CONF_OK) {
++                        *cf = pcf;
++                        return rv;
++                    }
++
++                    /* copy child to parent, tricky */
++                    ctx->proc_conf[mi] = cpcfp[p]->ctx->proc_conf[mi];
++                }
++            }
++        }
++    }
++
++    *cf = pcf;
++
++    return NGX_CONF_OK;
++}
++
++
++ngx_int_t
++ngx_procs_start(ngx_cycle_t *cycle, ngx_int_t type)
++{
++    ngx_int_t              rc, respawn;
++    ngx_uint_t             i, p, n;
++    ngx_channel_t          ch;
++    ngx_proc_args_t      **args;
++    ngx_proc_conf_t      **cpcfp;
++    ngx_proc_module_t     *module;
++    ngx_proc_main_conf_t  *cmcf;
++
++    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0, "start procs processes");
++
++    if (ngx_get_conf(cycle->conf_ctx, ngx_procs_module) == NULL) {
++        return NGX_OK;
++    }
++
++    ch.command = NGX_CMD_OPEN_CHANNEL;
++    cmcf = ngx_proc_get_main_conf(cycle->conf_ctx, ngx_proc_core_module);
++
++    cpcfp = cmcf->processes.elts;
++    args = ngx_pcalloc(cycle->pool,
++                       sizeof(ngx_proc_args_t *) * cmcf->processes.nelts);
++    if (args == NULL) {
++        return NGX_ERROR;
++    }
++
++    for (p = 0; p< cmcf->processes.nelts; p++) {
++        args[p] = ngx_pcalloc(cycle->pool, sizeof(ngx_proc_args_t));
++        if (args[p] == NULL) {
++            return NGX_ERROR;
++        }
++    }
++
++    respawn = type ? NGX_PROCESS_JUST_RESPAWN : NGX_PROCESS_RESPAWN;
++
++    for (i = 0; ngx_modules[i]; i++) {
++
++        if (ngx_modules[i]->type != NGX_PROC_MODULE) {
++            continue;
++        }
++
++        module = ngx_modules[i]->ctx;
++
++        for (p = 0; p < cmcf->processes.nelts; p++) {
++            if (ngx_strcmp(cpcfp[p]->name.data, module->name.data) == 0) {
++
++                if (module->prepare) {
++                    rc = module->prepare(cycle);
++                    if (rc != NGX_OK) {
++                        break;
++                    }
++                }
++
++                if (type == 1) {
++                    if (cpcfp[p]->respawn) {
++                        respawn = NGX_PROCESS_JUST_RESPAWN;
++                    }
++                } else {
++                    if (cpcfp[p]->respawn) {
++                        respawn = NGX_PROCESS_RESPAWN;
++                    } else {
++                        respawn = NGX_PROCESS_NORESPAWN;
++                    }
++                }
++
++                /* processes count */
++                for (n = 0; n < cpcfp[p]->count; n++) {
++                    args[p]->module = ngx_modules[i];
++                    args[p]->proc_conf = cpcfp[p];
++
++                    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
++                                  "start process %V", &cpcfp[p]->name);
++
++                    ngx_spawn_process(cycle, ngx_procs_cycle, args[p],
++                                      (char *) cpcfp[p]->name.data, respawn);
++
++                    ch.pid = ngx_processes[ngx_process_slot].pid;
++                    ch.slot = ngx_process_slot;
++                    ch.fd = ngx_processes[ngx_process_slot].channel[0];
++
++                    ngx_procs_pass_open_channel(cycle, &ch);
++                }
++            }
++        }
++    }
++
++    return NGX_OK;
++}
++
++
++static void
++ngx_procs_cycle(ngx_cycle_t *cycle, void *data)
++{
++    ngx_int_t           rc;
++    ngx_uint_t          i;
++    ngx_module_t       *module;
++    ngx_proc_args_t    *args;
++    ngx_proc_conf_t    *cpcf;
++    ngx_connection_t   *c;
++    ngx_proc_module_t  *ctx;
++
++    args = data;
++    module = args->module;
++    cpcf = args->proc_conf;
++    ctx = module->ctx;
++    ngx_process = NGX_PROCESS_PROC;
++
++    ngx_setproctitle((char *) ctx->name.data);
++    ngx_msleep(cpcf->delay_start);
++
++    ngx_procs_process_init(cycle, ctx, cpcf->priority);
++    ngx_close_listening_sockets(cycle);
++    ngx_use_accept_mutex = 0;
++
++    for ( ;; ) {
++        if (ngx_exiting || ngx_quit) {
++            ngx_exiting = 1;
++            ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
++                          "process %V gracefully shutting down", &ctx->name);
++            ngx_setproctitle("processes are shutting down");
++
++            c = cycle->connections;
++
++            for (i = 0; i < cycle->connection_n; i++) {
++                if (c[i].fd != -1 && c[i].idle) {
++                    c[i].close = 1;
++                    c[i].read->handler(c[i].read);
++                }
++            }
++
++            ngx_procs_process_exit(cycle, ctx);
++        }
++
++        if (ngx_terminate) {
++            ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0, "process %V exiting",
++                          &ctx->name);
++
++            ngx_procs_process_exit(cycle, ctx);
++        }
++
++        if (ngx_reopen) {
++            ngx_reopen = 0;
++            ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0, "reopening logs");
++            ngx_reopen_files(cycle, -1);
++        }
++
++        if (ctx->loop) {
++            rc = ctx->loop(cycle);
++            if (rc != NGX_OK) {
++                break;
++            }
++        }
++
++        ngx_time_update();
++
++        ngx_process_events_and_timers(cycle);
++    }
++
++    ngx_procs_process_exit(cycle, ctx);
++}
++
++
++static void
++ngx_procs_process_init(ngx_cycle_t *cycle, ngx_proc_module_t *module,
++    ngx_int_t priority)
++{
++    sigset_t          set;
++    ngx_int_t         n;
++    ngx_uint_t        i;
++    struct rlimit     rlmt;
++    ngx_core_conf_t  *ccf;
++    ngx_listening_t  *ls;
++
++    if (ngx_set_environment(cycle, NULL) == NULL) {
++        /* fatal */
++        exit(2);
++    }
++
++    ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
++
++    if (priority != 0) {
++        if (setpriority(PRIO_PROCESS, 0, (int) priority) == -1) {
++            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
++                          "process %V setpriority(%d) failed", &module->name,
++                          priority);
++        }
++    }
++
++    if (ccf->rlimit_nofile != NGX_CONF_UNSET) {
++        rlmt.rlim_cur = (rlim_t) ccf->rlimit_nofile;
++        rlmt.rlim_max = (rlim_t) ccf->rlimit_nofile;
++
++        if (setrlimit(RLIMIT_NOFILE, &rlmt) == -1) {
++            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
++                          "process %V setrlimit(RLIMIT_NOFILE, %i) failed",
++                          &module->name, ccf->rlimit_nofile);
++        }
++    }
++
++    if (ccf->rlimit_core != NGX_CONF_UNSET) {
++        rlmt.rlim_cur = (rlim_t) ccf->rlimit_core;
++        rlmt.rlim_max = (rlim_t) ccf->rlimit_core;
++
++        if (setrlimit(RLIMIT_CORE, &rlmt) == -1) {
++            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
++                          "process %V setrlimit(RLIMIT_CORE, %O) failed",
++                          &module->name, ccf->rlimit_core);
++        }
++    }
++
++#ifdef RLIMIT_SIGPENDING
++    if (ccf->rlimit_sigpending != NGX_CONF_UNSET) {
++        rlmt.rlim_cur = (rlim_t) ccf->rlimit_sigpending;
++        rlmt.rlim_max = (rlim_t) ccf->rlimit_sigpending;
++
++        if (setrlimit(RLIMIT_SIGPENDING, &rlmt) == -1) {
++            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
++                          "process %V setrlimit(RLIMIT_SIGPENDING, %i) failed",
++                          &module->name, ccf->rlimit_sigpending);
++        }
++    }
++#endif
++
++    if (geteuid() == 0) {
++        if (setgid(ccf->group) == -1) {
++            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
++                          "process %V setgid(%d) failed", &module->name,
++                          ccf->group);
++            /* fatal */
++            exit(2);
++        }
++
++        if (initgroups(ccf->username, ccf->group) == -1) {
++            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
++                          "process %V initgroups(%s, %d) failed", &module->name,
++                          ccf->username, ccf->group);
++        }
++
++        if (setuid(ccf->user) == -1) {
++            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
++                          "process %V setuid(%d) failed", &module->name,
++                          ccf->user);
++            /* fatal */
++            exit(2);
++        }
++    }
++
++#if (NGX_HAVE_PR_SET_DUMPABLE)
++
++    /* allow coredump after setuid() in Linux 2.4.x */
++
++    if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) == -1) {
++        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
++                      "process %V prctl(PR_SET_DUMPABLE) failed",
++                      &module->name);
++    }
++
++#endif
++
++    if (ccf->working_directory.len) {
++        if (chdir((char *) ccf->working_directory.data) == -1) {
++            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
++                          "process %V chdir(\"%s\") failed", &module->name,
++                          ccf->working_directory.data);
++            /* fatal */
++            exit(2);
++        }
++    }
++
++    sigemptyset(&set);
++
++    if (sigprocmask(SIG_SETMASK, &set, NULL) == -1) {
++        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
++                      "process %V sigprocmask() failed", &module->name);
++    }
++
++    /*
++     * disable deleting previous events for the listening sockets because
++     * in the worker processes there are no events at all at this point
++     */
++    ls = cycle->listening.elts;
++
++    for (i = 0; i < cycle->listening.nelts; i++) {
++        ls[i].previous = NULL;
++    }
++
++    if (ngx_event_core_module.init_process(cycle) != NGX_OK) {
++        ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
++                      "process %V init event error", &module->name);
++        exit(2);
++    }
++
++    if (module->init) {
++        if (module->init(cycle) != NGX_OK) {
++            ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
++                          "process %V process init error", &module->name);
++            exit(2);
++        }
++    }
++
++
++    for (n = 0; n < ngx_last_process; n++) {
++
++        if (ngx_processes[n].pid == -1) {
++            continue;
++        }
++
++        if (n == ngx_process_slot) {
++            continue;
++        }
++
++        if (ngx_processes[n].channel[1] == -1) {
++            continue;
++        }
++
++        if (close(ngx_processes[n].channel[1]) == -1) {
++            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
++                          "process %V close() channel failed", &module->name);
++        }
++    }
++
++    if (close(ngx_processes[ngx_process_slot].channel[0]) == -1) {
++        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
++                      "process %V close() channel failed", &module->name);
++    }
++
++#if 0
++    ngx_last_process = 0;
++#endif
++
++    if (ngx_add_channel_event(cycle, ngx_channel, NGX_READ_EVENT,
++                              ngx_procs_channel_handler)
++        == NGX_ERROR)
++    {
++        /* fatal */
++        exit(2);
++    }
++}
++
++
++static void
++ngx_procs_channel_handler(ngx_event_t *ev)
++{
++    ngx_int_t          n;
++    ngx_channel_t      ch;
++    ngx_connection_t  *c;
++
++    if (ev->timedout) {
++        ev->timedout = 0;
++        return;
++    }
++
++    c = ev->data;
++
++    ngx_log_debug0(NGX_LOG_DEBUG_CORE, ev->log, 0, "process channel handler");
++
++    for ( ;; ) {
++
++        n = ngx_read_channel(c->fd, &ch, sizeof(ngx_channel_t), ev->log);
++
++        ngx_log_debug1(NGX_LOG_DEBUG_CORE, ev->log, 0,
++                       "process channel: %i", n);
++
++        if (n == NGX_ERROR) {
++
++            if (ngx_event_flags & NGX_USE_EPOLL_EVENT) {
++                ngx_del_conn(c, 0);
++            }
++
++            ngx_close_connection(c);
++            return;
++        }
++
++        if (ngx_event_flags & NGX_USE_EVENTPORT_EVENT) {
++            if (ngx_add_event(ev, NGX_READ_EVENT, 0) == NGX_ERROR) {
++                return;
++            }
++        }
++
++        if (n == NGX_AGAIN) {
++            return;
++        }
++
++        ngx_log_debug1(NGX_LOG_DEBUG_CORE, ev->log, 0,
++                       "process channel command: %d", ch.command);
++
++        switch (ch.command) {
++
++        case NGX_CMD_QUIT:
++            ngx_quit = 1;
++            break;
++
++        case NGX_CMD_TERMINATE:
++            ngx_terminate = 1;
++            break;
++
++        case NGX_CMD_REOPEN:
++            ngx_reopen = 1;
++            break;
++
++        case NGX_CMD_OPEN_CHANNEL:
++
++            ngx_log_debug3(NGX_LOG_DEBUG_CORE, ev->log, 0,
++                           "process got channel s:%i pid:%P fd:%d",
++                           ch.slot, ch.pid, ch.fd);
++
++            ngx_processes[ch.slot].pid = ch.pid;
++            ngx_processes[ch.slot].channel[0] = ch.fd;
++            break;
++
++        case NGX_CMD_CLOSE_CHANNEL:
++
++            ngx_log_debug4(NGX_LOG_DEBUG_CORE, ev->log, 0,
++                           "process closed channel s:%i pid:%P our:%P fd:%d",
++                           ch.slot, ch.pid, ngx_processes[ch.slot].pid,
++                           ngx_processes[ch.slot].channel[0]);
++
++            if (close(ngx_processes[ch.slot].channel[0]) == -1) {
++                ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_errno,
++                              "process close() channel failed");
++            }
++
++            ngx_processes[ch.slot].channel[0] = -1;
++            break;
++        }
++    }
++}
++
++
++static void
++ngx_procs_process_exit(ngx_cycle_t *cycle, ngx_proc_module_t *module)
++{
++    ngx_uint_t         i;
++    ngx_connection_t  *c;
++
++#if (NGX_THREADS)
++    ngx_terminate = 1;
++
++    ngx_wakeup_worker_threads(cycle);
++#endif
++
++    if (module->exit) {
++        module->exit(cycle);
++    }
++
++    if (ngx_exiting) {
++        c = cycle->connections;
++        for (i = 0; i < cycle->connection_n; i++) {
++            if (c[i].fd != -1
++                && c[i].read
++                && !c[i].read->accept
++                && !c[i].read->channel
++                && !c[i].read->resolver)
++            {
++                ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
++                              "open socket #%d left in connection %ui",
++                              c[i].fd, i);
++                ngx_debug_quit = 1;
++            }
++        }
++
++        if (ngx_debug_quit) {
++            ngx_log_error(NGX_LOG_ALERT, cycle->log, 0, "aborting");
++            ngx_debug_point();
++        }
++    }
++
++    /*
++     * Copy ngx_cycle->log related data to the special static exit cycle,
++     * log, and log file structures enough to allow a signal handler to log.
++     * The handler may be called when standard ngx_cycle->log allocated from
++     * ngx_cycle->pool is already destroyed.
++     */
++
++    ngx_procs_exit_log_file.fd = ngx_cycle->log->file->fd;
++
++    ngx_procs_exit_log = *ngx_cycle->log;
++    ngx_procs_exit_log.file = &ngx_procs_exit_log_file;
++
++#if (NGX_SYSLOG)
++    if (ngx_procs_exit_log.syslog != NULL) {
++        ngx_procs_exit_log_syslog = *ngx_procs_exit_log.syslog;
++        ngx_procs_exit_log.syslog = &ngx_procs_exit_log_syslog;
++    }
++#endif
++
++    ngx_procs_exit_cycle.log = &ngx_procs_exit_log;
++    ngx_cycle = &ngx_procs_exit_cycle;
++
++    ngx_destroy_pool(cycle->pool);
++
++    ngx_log_error(NGX_LOG_NOTICE, ngx_cycle->log, 0, "process %V exit",
++                  &module->name);
++
++    exit(0);
++}
++
++
++static void
++ngx_procs_pass_open_channel(ngx_cycle_t *cycle, ngx_channel_t *ch)
++{
++    ngx_int_t  i;
++
++    for (i = 0; i < ngx_last_process; i++) {
++
++        if (i == ngx_process_slot
++            || ngx_processes[i].pid == -1
++            || ngx_processes[i].channel[0] == -1)
++        {
++            continue;
++        }
++
++        ngx_log_debug6(NGX_LOG_DEBUG_CORE, cycle->log, 0,
++            "process passed channel s:%d pid:%P fd:%d to s:%i pid:%P fd:%d",
++             ch->slot, ch->pid, ch->fd, i, ngx_processes[i].pid,
++             ngx_processes[i].channel[0]);
++
++        /* TODO: NGX_AGAIN */
++
++        ngx_write_channel(ngx_processes[i].channel[0],
++                          ch, sizeof(ngx_channel_t), cycle->log);
++    }
++}
++
++
++static char *
++ngx_proc_process(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
++{
++    char                  *rv;
++    void                  *mconf;
++    ngx_int_t              i;
++    ngx_str_t             *value;
++    ngx_flag_t             flag;
++    ngx_conf_t             pcf;
++    ngx_uint_t             m;
++    ngx_proc_conf_t       *cpcf, **cpcfp;
++    ngx_proc_module_t     *module;
++    ngx_proc_conf_ctx_t   *ctx, *procs_ctx;
++    ngx_proc_main_conf_t  *cmcf;
++
++    value = cf->args->elts;
++    flag = 0;
++
++    for (m = 0; ngx_modules[m]; m++) {
++        if (ngx_modules[m]->type != NGX_PROC_MODULE) {
++            continue;
++        }
++        module = ngx_modules[m]->ctx;
++
++        if (ngx_strcmp(module->name.data, value[1].data) == 0) {
++            flag = 1;
++            break;
++        }
++    }
++
++    if (flag == 0) {
++        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                           "no %V process module", &value[1]);
++        return NGX_CONF_ERROR;
++    }
++
++    /* new conf ctx */
++    ctx = ngx_pcalloc(cf->pool, sizeof(ngx_proc_conf_ctx_t));
++    if (ctx == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    procs_ctx = cf->ctx;
++    ctx->main_conf = procs_ctx->main_conf; /* old main conf */
++
++    /* the processes{}'s proc_conf */
++
++    ctx->proc_conf = ngx_pcalloc(cf->pool,
++                                 sizeof(void *) * ngx_procs_max_module);
++    if (ctx->proc_conf == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    for (m = 0; ngx_modules[m]; m++) {
++        if (ngx_modules[m]->type != NGX_PROC_MODULE) {
++            continue;
++        }
++
++        module = ngx_modules[m]->ctx;
++
++        if (module->create_proc_conf) {
++            mconf = module->create_proc_conf(cf);
++
++            if (mconf == NULL) {
++                return NGX_CONF_ERROR;
++            }
++
++            /* new proc conf */
++            ctx->proc_conf[ngx_modules[m]->ctx_index] = mconf;
++        }
++    }
++
++    /* the proc configuration context */
++
++    cpcf = ctx->proc_conf[ngx_proc_core_module.ctx_index];
++    cpcf->ctx = ctx;
++    cpcf->name = value[1];
++
++    cmcf = ctx->main_conf[ngx_proc_core_module.ctx_index];
++
++    cpcfp = ngx_array_push(&cmcf->processes);
++    if (cpcfp == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    *cpcfp = cpcf;
++
++    /* check process conf repeat */
++    cpcfp = cmcf->processes.elts;
++    for (i = cmcf->processes.nelts - 2; i >= 0 ; i--) {
++        if (ngx_strcmp(cpcfp[i]->name.data, cpcf->name.data) == 0) {
++            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "process repeat");
++            return NGX_CONF_ERROR;
++        }
++    }
++
++    /* parse inside process{} */
++
++    pcf = *cf;
++    cf->ctx = ctx;
++    cf->cmd_type = NGX_PROC_CONF;
++
++    rv = ngx_conf_parse(cf, NULL);
++
++    *cf = pcf;
++
++    return rv;
++}
++
++
++static void *
++ngx_proc_create_main_conf(ngx_conf_t *cf)
++{
++    ngx_proc_main_conf_t  *cmcf;
++
++    cmcf = ngx_pcalloc(cf->pool, sizeof(ngx_proc_main_conf_t));
++    if (cmcf == NULL) {
++        return NULL;
++    }
++
++    if (ngx_array_init(&cmcf->processes, cf->pool, 4, sizeof(ngx_proc_conf_t *))
++        != NGX_OK)
++    {
++        return NULL;
++    }
++
++    return cmcf;
++}
++
++
++static void *
++ngx_proc_create_conf(ngx_conf_t *cf)
++{
++    ngx_proc_conf_t  *cpcf;
++
++    cpcf = ngx_pcalloc(cf->pool, sizeof(ngx_proc_conf_t));
++    if (cpcf == NULL) {
++        return NULL;
++    }
++
++    /*
++     * set by ngx_pcalloc()
++     *
++     *     cpcf->delay_start = 0;
++     *     cpcf->priority = 0;
++     *     cpcf->count = 0;
++     *     cpcf->respawn = 0;
++     */
++
++    cpcf->delay_start = NGX_CONF_UNSET_MSEC;
++    cpcf->count = NGX_CONF_UNSET_UINT;
++    cpcf->respawn = NGX_CONF_UNSET;
++
++    return cpcf;
++}
++
++
++static char *
++ngx_proc_merge_conf(ngx_conf_t *cf, void *parent, void *child)
++{
++    ngx_proc_conf_t  *prev = parent;
++    ngx_proc_conf_t  *conf = child;
++
++    ngx_conf_merge_msec_value(conf->delay_start, prev->delay_start, 300);
++    ngx_conf_merge_uint_value(conf->count, prev->count, 1);
++    ngx_conf_merge_value(conf->respawn, prev->respawn, 1);
++
++    return NGX_CONF_OK;
++}
++
++
++static char *
++ngx_procs_set_priority(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
++{
++    ngx_proc_conf_t  *pcf = conf;
++
++    ngx_str_t        *value;
++    ngx_uint_t        n, minus;
++
++    if (pcf->priority != 0) {
++        return "is duplicate";
++    }
++
++    value = cf->args->elts;
++
++    if (value[1].data[0] == '-') {
++        n = 1;
++        minus = 1;
++
++    } else if (value[1].data[0] == '+') {
++        n = 1;
++        minus = 0;
++
++    } else {
++        n = 0;
++        minus = 0;
++    }
++
++    pcf->priority = ngx_atoi(&value[1].data[n], value[1].len - n);
++    if (pcf->priority == NGX_ERROR) {
++        return "invalid number";
++    }
++
++    if (minus) {
++        pcf->priority = -pcf->priority;
++    }
++
++    return NGX_CONF_OK;
++}
+diff --git a/src/proc/ngx_proc.h b/src/proc/ngx_proc.h
+new file mode 100644
+index 0000000..d5025b9
+--- /dev/null
++++ b/src/proc/ngx_proc.h
+@@ -0,0 +1,89 @@
++
++/*
++ * Copyright (C) 2010-2012 Alibaba Group Holding Limited
++ */
++
++#ifndef _NGX_PROC_H_INCLUDED_
++#define _NGX_PROC_H_INCLUDED_
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++
++
++#define NGX_PROC_MODULE            0x434f5250  /* "PROC" */
++#define NGX_PROC_MAIN_CONF         0x02000000
++#define NGX_PROC_CONF              0x04000000
++
++
++#define NGX_PROC_MAIN_CONF_OFFSET  offsetof(ngx_proc_conf_ctx_t, main_conf)
++#define NGX_PROC_CONF_OFFSET       offsetof(ngx_proc_conf_ctx_t, proc_conf)
++
++
++typedef struct {
++    void                         **main_conf;
++    void                         **proc_conf;
++} ngx_proc_conf_ctx_t;
++
++
++typedef struct {
++    ngx_str_t                      name;
++
++    ngx_int_t                      priority;
++    ngx_msec_t                     delay_start;
++    ngx_uint_t                     count;
++    ngx_flag_t                     respawn;
++
++    ngx_proc_conf_ctx_t           *ctx;
++} ngx_proc_conf_t;
++
++
++typedef struct {
++    ngx_array_t                    processes; /* ngx_proc_conf_t */
++} ngx_proc_main_conf_t;
++
++
++typedef struct ngx_proc_args_s {
++    ngx_module_t                  *module;
++    ngx_proc_conf_t               *proc_conf;
++} ngx_proc_args_t;
++
++
++typedef struct {
++    ngx_str_t                      name;
++    void                        *(*create_main_conf)(ngx_conf_t *cf);
++    char                        *(*init_main_conf)(ngx_conf_t *cf, void *conf);
++    void                        *(*create_proc_conf)(ngx_conf_t *cf);
++    char                        *(*merge_proc_conf)(ngx_conf_t *cf,
++                                                    void *parent, void *child);
++
++    ngx_int_t                    (*prepare)(ngx_cycle_t *cycle);
++    ngx_int_t                    (*init)(ngx_cycle_t *cycle);
++    ngx_int_t                    (*loop)(ngx_cycle_t *cycle);
++    void                         (*exit)(ngx_cycle_t *cycle);
++} ngx_proc_module_t;
++
++
++#define ngx_proc_get_main_conf(conf_ctx, module)           \
++    ((ngx_get_conf(conf_ctx, ngx_procs_module)) ?          \
++        ((ngx_proc_conf_ctx_t *) (ngx_get_conf(conf_ctx,   \
++              ngx_procs_module)))->main_conf[module.ctx_index] : NULL)
++
++
++#define ngx_proc_get_conf(conf_ctx, module)                \
++    ((ngx_get_conf(conf_ctx, ngx_procs_module)) ?          \
++        ((ngx_proc_conf_ctx_t *) (ngx_get_conf(conf_ctx,   \
++              ngx_procs_module)))->proc_conf[module.ctx_index] : NULL)
++
++
++ngx_int_t ngx_procs_start(ngx_cycle_t *cycle, ngx_int_t type);
++
++
++extern ngx_module_t  ngx_procs_module;
++extern ngx_module_t  ngx_proc_core_module;
++
++
++
++
++
++#endif /* _NGX_PROC_H_INCLUDED_ */
